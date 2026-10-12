@@ -1,0 +1,151 @@
+# INC-003: Cron Persistence Detection
+
+## What this is
+
+After an attacker gets in (INC-001) and becomes root (INC-002), they need a way back. A cron job is one of the simplest: "every minute, run this script as root." Wazuh's default File Integrity Monitoring (FIM) technically watches the folder where cron jobs live, but it is configured so loosely that a planted cron job goes unnoticed for up to 12 hours, and when it finally alerts, nothing says "persistence". I found both gaps, fixed them, and tested with a harmless cron job.
+
+## The gaps
+
+**1. Timing.** FIM scans on a schedule, not in real time:
+
+```bash
+sudo sed -n '/<syscheck>/,/<\/syscheck>/p' /var/ossec/etc/ossec.conf
+```
+
+```xml
+<frequency>43200</frequency>
+<directories>/etc,/usr/bin,/usr/sbin</directories>
+```
+
+`43200` seconds is 12 hours, and there is no `realtime="yes"` anywhere. `/etc/cron.d` is covered, but a new file there can sit unnoticed for half a day. My first test file (`soc-test`) never produced a FIM alert at all.
+
+**2. Meaning.** Once real-time was on, the default alert for a new cron file was rule 554: level 5, "File added to the system", no MITRE mapping. The same rule fires for any new file in `/etc`, so it looks like noise. Nothing says this is a root job running every minute.
+
+**Also noted:**
+- **Baseline blind spot:** a file planted before FIM was tuned gets absorbed into the baseline and never alerts as "added". The original `soc-test` showed up later only as a deletion.
+- **Attribution:** FIM shows the owner as `root` because the file was written via `sudo`. Only the separate sudo alert (rule 5402) named the user, `pvee`.
+
+## The fix
+
+**1. Real-time monitoring on the cron paths**, added to `/var/ossec/etc/ossec.conf` inside `<syscheck>`:
+
+```xml
+<directories realtime="yes" check_all="yes" report_changes="yes">/etc/cron.d,/etc/cron.hourly,/etc/cron.daily,/etc/cron.weekly,/etc/crontab,/var/spool/cron</directories>
+```
+
+**2. A custom rule**, added to `/var/ossec/etc/rules/local_rules.xml`:
+
+```xml
+<group name="syscheck,persistence,">
+  <rule id="100301" level="12">
+    <if_sid>554</if_sid>
+    <field name="file" type="pcre2">^/etc/cron\.d/|^/etc/cron\.(hourly|daily|weekly|monthly)/|^/etc/crontab|^/var/spool/cron/</field>
+    <description>Persistence: new cron job file created ($(file)).</description>
+    <mitre>
+      <id>T1053.003</id>
+    </mitre>
+    <group>persistence,</group>
+  </rule>
+</group>
+```
+
+100301 — a new file in any cron location → level 12 alert tagged as persistence.
+
+Load it (check the rules parse first, because a bad rule file stops the manager from starting):
+
+```bash
+sudo /var/ossec/bin/wazuh-analysisd -t
+sudo systemctl restart wazuh-manager
+sudo systemctl status wazuh-manager
+```
+
+**Lesson learned:** my first version of the rule used a regex group without `type="pcre2"`. Wazuh's default regex engine doesn't support that syntax, so the rule failed to load and the whole manager refused to start. Always run `wazuh-analysisd -t` before restarting.
+
+## Proof it works
+
+Attack simulation: a harmless root cron job that only appends a timestamp to a file:
+
+```bash
+echo '* * * * * root echo "soc-lab persistence test $(date)" >> /tmp/soc-test.log' | sudo tee /etc/cron.d/soc-test4
+```
+
+Check the result:
+
+```bash
+sudo tail -n 50 /var/ossec/logs/alerts/alerts.json | jq -r 'select(.syscheck.path != null) | [.timestamp[11:19], .rule.id, .rule.level, .rule.description, (.rule.mitre.id // [] | join(",")), .syscheck.path] | @tsv'
+```
+
+What you'll see:
+
+| Time | Rule | Level | What happened |
+|---|---|---|---|
+| 19:00:59 | 554 | 5 | `soc-test2` created, real-time on, default rule: generic "file added", no MITRE |
+| 19:08:53 | **100301** | **12** | `soc-test4` created, custom rule: "Persistence: new cron job file created", **T1053.003** |
+| 19:09:47 | 553 | 7 | Cleanup: four "File deleted" alerts |
+
+The FIM record matched the filesystem: the SHA-256 in the alert (`93756fa0…c4435`) was identical to `sha256sum` on the file, as were the size, permissions, owner and inode. The hash is a usable indicator for threat-intel lookups or for searching other hosts.
+
+Screenshots: `screenshots/`
+
+## How to investigate the alert
+
+FIM tells you what changed, not who did it. Join it with the sudo alert by timestamp:
+
+| Question | Where the answer is |
+|---|---|
+| What file? | `syscheck.path`, `syscheck.event` |
+| What does it run? | `sudo cat /etc/cron.d/<file>`. FIM doesn't show content |
+| Is the file intact? | `syscheck.sha256_after` vs `sha256sum` |
+| Who created it? | Rule 5402 (sudo) at the same time: user `pvee`, `pts/2`, the exact `tee` command |
+| When? | `syscheck.mtime_after` and the alert timestamp |
+
+## How to demo this live
+
+1. Show the gap:
+   ```bash
+   sudo sed -n '/<syscheck>/,/<\/syscheck>/p' /var/ossec/etc/ossec.conf
+   ```
+2. Show the fix:
+   ```bash
+   cat /var/ossec/etc/rules/local_rules.xml
+   ```
+3. Plant the cron job and show it firing:
+   ```bash
+   echo '* * * * * root echo "demo $(date)" >> /tmp/soc-test.log' | sudo tee /etc/cron.d/soc-demo
+   sleep 10
+   sudo grep '"id":"100301"' /var/ossec/logs/alerts/alerts.json | tail -1 | jq .
+   ```
+4. Clean up:
+   ```bash
+   sudo rm -f /etc/cron.d/soc-demo /tmp/soc-test.log
+   ```
+
+## MITRE ATT&CK
+
+| Technique | ID |
+|---|---|
+| Scheduled Task/Job: Cron | T1053.003 |
+
+## Limitations
+
+- **Only new files are covered.** Rule 100301 chains off rule 554 ("added"). Editing an existing cron file triggers rule 550 instead, which the rule doesn't cover.
+- **Baseline blind spot.** Persistence planted before FIM was tuned is treated as normal.
+- **No automatic attribution.** `whodata="yes"` (needs `auditd`) would record which user and process made the change.
+- **Deletions are low severity.** Rule 553 fires at level 7 even on cron paths, but removing a job can also be an attacker covering their tracks.
+- **Other persistence is not covered.** Systemd services and `authorized_keys` are separate techniques, which are the subject of INC-004 and beyond.
+
+## What I'd do next in a real environment
+
+- Read the cron file and identify what it runs (look for `curl`, `wget`, `base64`, or reverse shells)
+- Identify who created it and the session they came from
+- Remove the job and check for other persistence (systemd units, `authorized_keys`, shell profiles)
+- Hash the file and search other hosts for the same indicator
+- Rotate credentials and review everything the account did after the initial access
+
+## Story so far
+
+| Incident | Stage | Technique | Detection |
+|---|---|---|---|
+| INC-001 | Initial access | T1110.001 | Rules 100010 / 100011 |
+| INC-002 | Privilege escalation | T1548.003 | Rule 100020 |
+| **INC-003** | **Persistence** | **T1053.003** | **Rule 100301 + real-time FIM** |
